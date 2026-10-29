@@ -15,3 +15,5 @@
 ├── docs/screenshots/
 ├── .gitignore
 └── README.md
+
+<img width="2000" height="2400" alt="image" src="https://github.com/user-attachments/assets/66d3755e-9000-45e7-a6a5-371da60a6346" />
