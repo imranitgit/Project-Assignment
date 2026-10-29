@@ -1,0 +1,128 @@
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/*]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/*]
+
+parameters:
+  - name: environment
+    type: string
+    default: dev
+    values: [dev, prod]
+
+variables:
+  serviceConnection: sc-azure-wif
+  tfVersion: "1.9.8"
+  tfstateRg: rg-tfstate
+  tfstateSa: <your-state-storage-account>   # name only, not a secret
+  tfKey: ${{ parameters.environment }}.tfstate
+  varFile: envs/${{ parameters.environment }}.tfvars
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # ---------------- Stage 1: static checks (no Azure access needed) ----------------
+  - stage: Validate
+    jobs:
+      - job: validate
+        steps:
+          - bash: |
+              curl -sSLo tf.zip https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip
+              sudo unzip -oq tf.zip -d /usr/local/bin
+              terraform version
+            displayName: Install Terraform
+
+          - bash: terraform fmt -check -recursive
+            workingDirectory: infra
+            displayName: terraform fmt
+
+          - bash: |
+              terraform init -backend=false -input=false
+              terraform validate
+            workingDirectory: infra
+            displayName: terraform validate
+
+          # Bonus: IaC security scan
+          - bash: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                | sudo sh -s -- -b /usr/local/bin
+              trivy config infra --severity HIGH,CRITICAL --exit-code 1
+            displayName: Trivy IaC scan (bonus)
+
+  # ---------------- Stage 2: plan ----------------
+  - stage: Plan
+    dependsOn: Validate
+    jobs:
+      - job: plan
+        steps:
+          - bash: |
+              curl -sSLo tf.zip https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip
+              sudo unzip -oq tf.zip -d /usr/local/bin
+            displayName: Install Terraform
+
+          - task: AzureCLI@2
+            displayName: terraform init + plan
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              workingDirectory: infra
+              inlineScript: |
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_USE_CLI=true
+                terraform init -input=false \
+                  -backend-config="resource_group_name=$(tfstateRg)" \
+                  -backend-config="storage_account_name=$(tfstateSa)" \
+                  -backend-config="container_name=tfstate" \
+                  -backend-config="key=$(tfKey)" \
+                  -backend-config="use_azuread_auth=true"
+                terraform plan -input=false -var-file=$(varFile) -out=tfplan
+
+          - publish: infra/tfplan
+            artifact: tfplan
+            displayName: Publish plan
+
+  # ---------------- Stage 3: apply (skipped on PRs, gated by Environment) ----------------
+  - stage: Apply
+    dependsOn: Plan
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: apply
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - bash: |
+                    curl -sSLo tf.zip https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip
+                    sudo unzip -oq tf.zip -d /usr/local/bin
+                    cp $(Pipeline.Workspace)/tfplan/tfplan infra/tfplan
+                  displayName: Install Terraform + stage plan file
+
+                - task: AzureCLI@2
+                  displayName: terraform apply
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    workingDirectory: infra
+                    inlineScript: |
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      export ARM_USE_CLI=true
+                      terraform init -input=false \
+                        -backend-config="resource_group_name=$(tfstateRg)" \
+                        -backend-config="storage_account_name=$(tfstateSa)" \
+                        -backend-config="container_name=tfstate" \
+                        -backend-config="key=$(tfKey)" \
+                        -backend-config="use_azuread_auth=true"
+                      terraform apply -input=false tfplan
+                      terraform output
