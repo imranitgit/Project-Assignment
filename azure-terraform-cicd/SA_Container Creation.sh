@@ -1,0 +1,1 @@
+az storage container create -n tfstate --account-name $TF_SA --auth-mode login
